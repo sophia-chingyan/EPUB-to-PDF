@@ -16,24 +16,31 @@ from reportlab.platypus import (
 )
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT, TA_JUSTIFY
 from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfbase.ttfonts import TTFont
 
 # ── Font Registration ────────────────────────────────────────────────────────
-pdfmetrics.registerFont(UnicodeCIDFont('MSung-Light'))
-pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
-pdfmetrics.registerFont(UnicodeCIDFont('HeiseiMin-W3'))
-pdfmetrics.registerFont(UnicodeCIDFont('HeiseiKakuGo-W5'))
-pdfmetrics.registerFont(UnicodeCIDFont('HYSMyeongJo-Medium'))
-pdfmetrics.registerFont(TTFont('IPAGothic', '/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf'))
+# Use fully-embedded TTFonts so ALL PDF readers can display CJK text without
+# needing system fonts installed. UnicodeCIDFont (MSung-Light etc.) only works
+# when the reader has those CID fonts built-in (e.g. Adobe Reader), causing
+# blank/garbled text in many apps.
+
+# WenQuanYi Zen Hei covers Traditional Chinese, Simplified Chinese, and Korean
+# IPA Gothic covers Japanese
+_WQY_PATH = '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc'
+_IPA_PATH  = '/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf'
+
+pdfmetrics.registerFont(TTFont('WQY',       _WQY_PATH, subfontIndex=0))
+pdfmetrics.registerFont(TTFont('IPAGothic', _IPA_PATH))
 
 FONT_EN_REGULAR = 'Times-Roman'
 FONT_EN_BOLD    = 'Times-Bold'
 FONT_EN_ITALIC  = 'Times-Italic'
-FONT_TC = 'MSung-Light'
-FONT_SC = 'STSong-Light'
-FONT_JA = 'HeiseiMin-W3'
-FONT_KO = 'HYSMyeongJo-Medium'
+
+# Single embedded font covers TC + SC + KO; IPA covers JA
+FONT_TC = 'WQY'
+FONT_SC = 'WQY'
+FONT_JA = 'IPAGothic'
+FONT_KO = 'WQY'
 
 PAGE_W, PAGE_H = A4
 MARGIN_L = MARGIN_R = 3.2 * cm
@@ -75,7 +82,6 @@ def parse_epub(epub_bytes):
     with zipfile.ZipFile(io.BytesIO(epub_bytes)) as z:
         names_set = set(z.namelist())
 
-        # Load all images eagerly
         IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
         for name in z.namelist():
             if os.path.splitext(name)[1].lower() in IMAGE_EXTS:
@@ -84,7 +90,6 @@ def parse_epub(epub_bytes):
                 except Exception:
                     pass
 
-        # container.xml -> OPF
         opf_path = None
         if 'META-INF/container.xml' in names_set:
             soup = BeautifulSoup(
@@ -194,11 +199,9 @@ def parse_html_chapter(html_content, chapter_base, image_map):
         tag = (node.name or '').lower()
         style_attr = node.get('style', '') if hasattr(node, 'get') else ''
 
-        # Page break
         if 'page-break-before: always' in style_attr or 'break-before: page' in style_attr:
             elements.append({'type': 'pagebreak'})
 
-        # Image
         if tag == 'img':
             src = node.get('src') or node.get('data-src') or ''
             path = resolve_src(src)
@@ -272,7 +275,6 @@ def parse_html_chapter(html_content, chapter_base, image_map):
                     elements.append({'type':'para','text':line,'align':None})
             return
 
-        # generic containers
         cls = ' '.join(node.get('class', [])) if hasattr(node, 'get') else ''
         if 'pagebreak' in cls or 'page-break' in cls:
             elements.append({'type':'pagebreak'})
@@ -285,7 +287,6 @@ def parse_html_chapter(html_content, chapter_base, image_map):
                 process(child, list_depth)
             return
 
-        # fallback
         for img in node.find_all('img'): process(img, list_depth)
         for img in node.find_all('img'): img.decompose()
         t = node.get_text(separator=' ', strip=True)
@@ -312,6 +313,8 @@ def build_pdf(title, author, chapters, image_map):
     def base_font(variant='regular'):
         if not is_cjk:
             return {'bold':FONT_EN_BOLD,'italic':FONT_EN_ITALIC}.get(variant, FONT_EN_REGULAR)
+        # For CJK, all variants map to the same embedded font
+        # (WQY/IPA don't have bold/italic variants available as separate TTF here)
         return {'tc':FONT_TC,'sc':FONT_SC,'ja':FONT_JA,'ko':FONT_KO}[dom]
 
     lm = 1.72 if is_cjk else 1.55
@@ -380,7 +383,6 @@ def build_pdf(title, author, chapters, image_map):
             if orig_w == 0 or orig_h == 0:
                 return None
 
-            # Normalise mode/format for ReportLab
             if pil.mode in ('P','RGBA','LA') or (pil.format or '').upper() in ('WEBP','GIF'):
                 bg = PILImage.new('RGB', pil.size, (255,255,255))
                 src = pil.convert('RGBA')
@@ -412,7 +414,6 @@ def build_pdf(title, author, chapters, image_map):
                 draw_w = orig_w * scale
                 draw_h = orig_h * scale
 
-            # Final height guard
             if draw_h > max_h:
                 draw_w *= max_h / draw_h
                 draw_h  = max_h
@@ -474,7 +475,6 @@ def build_pdf(title, author, chapters, image_map):
 
             elif etype == 'img':
                 img_flow = make_image_flowable(el)
-                # Peek for caption
                 next_el = chapter_elements[i+1] if i+1 < len(chapter_elements) else None
                 has_caption = next_el and next_el.get('type') == 'caption'
 
@@ -485,7 +485,7 @@ def build_pdf(title, author, chapters, image_map):
                         i += 1
                     story.append(KeepTogether(block))
                 elif has_caption:
-                    i += 1  # skip orphaned caption
+                    i += 1
 
             elif etype == 'caption':
                 story.append(safe_para(el['text'], s_caption))
