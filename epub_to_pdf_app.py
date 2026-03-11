@@ -16,24 +16,23 @@ from reportlab.platypus import (
 )
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT, TA_JUSTIFY
 from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfbase.ttfonts import TTFont
 
 # ── Font Registration ────────────────────────────────────────────────────────
-pdfmetrics.registerFont(UnicodeCIDFont('MSung-Light'))
-pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
-pdfmetrics.registerFont(UnicodeCIDFont('HeiseiMin-W3'))
-pdfmetrics.registerFont(UnicodeCIDFont('HeiseiKakuGo-W5'))
-pdfmetrics.registerFont(UnicodeCIDFont('HYSMyeongJo-Medium'))
-pdfmetrics.registerFont(TTFont('IPAGothic', '/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf'))
+# Embedded TTF fonts – works in all PDF readers (no CID dependency)
+_WQY_PATH = '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc'
+_IPA_PATH  = '/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf'
+
+pdfmetrics.registerFont(TTFont('WenQuanYi',  _WQY_PATH, subfontIndex=0))
+pdfmetrics.registerFont(TTFont('IPAGothic',  _IPA_PATH))
 
 FONT_EN_REGULAR = 'Times-Roman'
 FONT_EN_BOLD    = 'Times-Bold'
 FONT_EN_ITALIC  = 'Times-Italic'
-FONT_TC = 'MSung-Light'
-FONT_SC = 'STSong-Light'
-FONT_JA = 'HeiseiMin-W3'
-FONT_KO = 'HYSMyeongJo-Medium'
+FONT_TC = 'WenQuanYi'
+FONT_SC = 'WenQuanYi'
+FONT_JA = 'IPAGothic'
+FONT_KO = 'WenQuanYi'
 
 PAGE_W, PAGE_H = A4
 MARGIN_L = MARGIN_R = 3.2 * cm
