@@ -138,12 +138,17 @@ def parse_epub(epub_bytes):
     with zipfile.ZipFile(io.BytesIO(epub_bytes)) as z:
         names_set = set(z.namelist())
 
-        # Load all images eagerly
-        IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
+        # Load all images eagerly (raster + SVG containers)
+        IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif', '.svg'}
         for name in z.namelist():
             if os.path.splitext(name)[1].lower() in IMAGE_EXTS:
                 try:
-                    image_map[name] = z.read(name)
+                    data = z.read(name)
+                    image_map[name] = data
+                    # Also index by lowercased path for case-insensitive href matching
+                    lname = name.lower()
+                    if lname != name:
+                        image_map.setdefault(lname, data)
                 except Exception:
                     pass
 
@@ -236,14 +241,25 @@ def parse_html_chapter(html_content, chapter_base, image_map):
     def resolve_src(src):
         if not src:
             return None
+        # data: URI — store inline bytes under a synthetic key
+        if src.startswith('data:'):
+            return src  # handled directly in make_image_flowable
         src = src.split('?')[0].split('#')[0]
-        for candidate in [src, resolve_path(chapter_base, src),
-                          resolve_path(chapter_base, src).lstrip('/')]:
+        candidates = [
+            src,
+            resolve_path(chapter_base, src),
+            resolve_path(chapter_base, src).lstrip('/'),
+        ]
+        for candidate in candidates:
             if candidate in image_map:
                 return candidate
-        basename = posixpath.basename(src)
+            # Case-insensitive fallback
+            if candidate.lower() in image_map:
+                return candidate.lower()
+        # Last resort: match by basename (case-insensitive)
+        basename = posixpath.basename(src).lower()
         for k in image_map:
-            if posixpath.basename(k) == basename:
+            if posixpath.basename(k).lower() == basename:
                 return k
         return None
 
@@ -267,7 +283,12 @@ def parse_html_chapter(html_content, chapter_base, image_map):
 
         # Image
         if tag == 'img':
+            # Try src, then data-src, then first entry in srcset
             src = node.get('src') or node.get('data-src') or ''
+            if not src:
+                srcset = node.get('srcset', '')
+                if srcset:
+                    src = srcset.split(',')[0].strip().split()[0]
             path = resolve_src(src)
             if path:
                 w_hint = css_to_pt(node.get('width'))
@@ -284,7 +305,20 @@ def parse_html_chapter(html_content, chapter_base, image_map):
                                   'width_hint': w_hint, 'height_hint': h_hint})
             return
 
-        if tag == 'svg': return
+        # SVG container — extract any raster <image> tags inside instead of skipping
+        if tag == 'svg':
+            for img_node in node.find_all('image'):
+                href = (img_node.get('xlink:href') or img_node.get('href')
+                        or img_node.get('src') or '')
+                path = resolve_src(href)
+                if path:
+                    w_hint = css_to_pt(img_node.get('width'))
+                    h_hint = css_to_pt(img_node.get('height'))
+                    parent_align = get_align(node.parent) if node.parent else None
+                    elements.append({'type':'img','path':path,'alt':'',
+                                     'align': parent_align or 'center',
+                                     'width_hint': w_hint, 'height_hint': h_hint})
+            return
 
         if tag == 'figure':
             for child in node.children: process(child, list_depth)
@@ -477,29 +511,91 @@ def build_pdf(title, author, chapters, image_map):
         w_hint = el.get('width_hint')
         h_hint = el.get('height_hint')
 
-        img_bytes = image_map.get(path)
-        if not img_bytes:
-            return None
+        # ── Resolve raw bytes ────────────────────────────────────────────────
+        if path.startswith('data:'):
+            # Inline data: URI  e.g. data:image/png;base64,....
+            import base64 as _b64
+            m = re.match(r'data:image/[^;]+;base64,(.+)', path, re.DOTALL)
+            if not m:
+                return None
+            try:
+                img_bytes = _b64.b64decode(m.group(1))
+            except Exception:
+                return None
+        else:
+            img_bytes = image_map.get(path)
+            if not img_bytes:
+                return None
+
         try:
+            # ── SVG: convert to PNG via PIL/resvg fallback ───────────────────
+            ext = os.path.splitext(path)[1].lower() if not path.startswith('data:') else ''
+            if ext == '.svg' or path.startswith('data:image/svg'):
+                # Try to render SVG by extracting any embedded raster href
+                try:
+                    svg_soup = BeautifulSoup(img_bytes, 'lxml-xml')
+                    img_tag = svg_soup.find('image')
+                    if img_tag:
+                        href = (img_tag.get('xlink:href') or img_tag.get('href') or '')
+                        if href.startswith('data:'):
+                            import base64 as _b64
+                            m2 = re.match(r'data:image/[^;]+;base64,(.+)', href, re.DOTALL)
+                            if m2:
+                                img_bytes = _b64.b64decode(m2.group(1))
+                            else:
+                                return None
+                        elif href:
+                            resolved = resolve_src(href)
+                            img_bytes = image_map.get(resolved) if resolved else None
+                            if not img_bytes:
+                                return None
+                        else:
+                            return None
+                    else:
+                        return None  # SVG with no embedded raster
+                except Exception:
+                    return None
+
+            # ── Open with PIL ────────────────────────────────────────────────
             pil = PILImage.open(io.BytesIO(img_bytes))
+            pil.load()  # force decode so errors surface here, not later
             orig_w, orig_h = pil.size
             if orig_w == 0 or orig_h == 0:
                 return None
 
-            # Normalise mode/format for ReportLab
-            if pil.mode in ('P','RGBA','LA') or (pil.format or '').upper() in ('WEBP','GIF'):
-                bg = PILImage.new('RGB', pil.size, (255,255,255))
-                src = pil.convert('RGBA')
-                bg.paste(src, mask=src.split()[3] if src.mode == 'RGBA' else None)
-                tmp = io.BytesIO()
-                bg.save(tmp, format='PNG')
-                img_bytes = tmp.getvalue()
-            elif pil.mode not in ('RGB','L'):
-                pil2 = pil.convert('RGB')
-                tmp = io.BytesIO()
-                pil2.save(tmp, format='PNG')
-                img_bytes = tmp.getvalue()
+            # ── Normalise to RGB/L PNG for ReportLab ─────────────────────────
+            fmt = (pil.format or '').upper()
+            if pil.mode == 'RGBA':
+                # Preserve transparency by compositing onto white
+                bg = PILImage.new('RGB', pil.size, (255, 255, 255))
+                bg.paste(pil, mask=pil.split()[3])
+                pil = bg
+            elif pil.mode == 'LA':
+                bg = PILImage.new('L', pil.size, 255)
+                bg.paste(pil.split()[0], mask=pil.split()[1])
+                pil = bg
+            elif pil.mode == 'P':
+                # Palette: may have transparency
+                pil = pil.convert('RGBA')
+                bg = PILImage.new('RGB', pil.size, (255, 255, 255))
+                bg.paste(pil, mask=pil.split()[3])
+                pil = bg
+            elif pil.mode == 'CMYK':
+                pil = pil.convert('RGB')
+            elif pil.mode == 'YCbCr':
+                pil = pil.convert('RGB')
+            elif pil.mode == '1':
+                pil = pil.convert('L')
+            elif pil.mode not in ('RGB', 'L'):
+                pil = pil.convert('RGB')
 
+            # Re-encode as PNG (handles WebP, GIF, BMP, TIFF, CMYK JPEG, etc.)
+            tmp = io.BytesIO()
+            pil.save(tmp, format='PNG')
+            img_bytes = tmp.getvalue()
+            orig_w, orig_h = pil.size  # update after mode conversion (size unchanged but be safe)
+
+            # ── Scale to fit page ────────────────────────────────────────────
             max_w = CONTENT_W
             max_h = PAGE_H * 0.75
 
@@ -518,14 +614,15 @@ def build_pdf(title, author, chapters, image_map):
                 draw_w = orig_w * scale
                 draw_h = orig_h * scale
 
-            # Final height guard
             if draw_h > max_h:
                 draw_w *= max_h / draw_h
                 draw_h  = max_h
 
-            rl_align = {'left':'LEFT','right':'RIGHT'}.get(align,'CENTER')
+            rl_align = {'left': 'LEFT', 'right': 'RIGHT'}.get(align, 'CENTER')
             return RLImage(io.BytesIO(img_bytes), width=draw_w, height=draw_h, hAlign=rl_align)
-        except Exception:
+
+        except Exception as exc:
+            import traceback; traceback.print_exc()
             return None
 
     # ── Story assembly ────────────────────────────────────────────────────────
