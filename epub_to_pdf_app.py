@@ -16,31 +16,24 @@ from reportlab.platypus import (
 )
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT, TA_JUSTIFY
 from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfbase.ttfonts import TTFont
 
 # ── Font Registration ────────────────────────────────────────────────────────
-# Use fully-embedded TTFonts so ALL PDF readers can display CJK text without
-# needing system fonts installed. UnicodeCIDFont (MSung-Light etc.) only works
-# when the reader has those CID fonts built-in (e.g. Adobe Reader), causing
-# blank/garbled text in many apps.
-
-# WenQuanYi Zen Hei covers Traditional Chinese, Simplified Chinese, and Korean
-# IPA Gothic covers Japanese
-_WQY_PATH = '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc'
-_IPA_PATH  = '/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf'
-
-pdfmetrics.registerFont(TTFont('WQY',       _WQY_PATH, subfontIndex=0))
-pdfmetrics.registerFont(TTFont('IPAGothic', _IPA_PATH))
+pdfmetrics.registerFont(UnicodeCIDFont('MSung-Light'))
+pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
+pdfmetrics.registerFont(UnicodeCIDFont('HeiseiMin-W3'))
+pdfmetrics.registerFont(UnicodeCIDFont('HeiseiKakuGo-W5'))
+pdfmetrics.registerFont(UnicodeCIDFont('HYSMyeongJo-Medium'))
+pdfmetrics.registerFont(TTFont('IPAGothic', '/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf'))
 
 FONT_EN_REGULAR = 'Times-Roman'
 FONT_EN_BOLD    = 'Times-Bold'
 FONT_EN_ITALIC  = 'Times-Italic'
-
-# Single embedded font covers TC + SC + KO; IPA covers JA
-FONT_TC = 'WQY'
-FONT_SC = 'WQY'
-FONT_JA = 'IPAGothic'
-FONT_KO = 'WQY'
+FONT_TC = 'MSung-Light'
+FONT_SC = 'STSong-Light'
+FONT_JA = 'HeiseiMin-W3'
+FONT_KO = 'HYSMyeongJo-Medium'
 
 PAGE_W, PAGE_H = A4
 MARGIN_L = MARGIN_R = 3.2 * cm
@@ -74,6 +67,68 @@ def resolve_path(base_dir, href):
         return posixpath.normpath(posixpath.join(base_dir, href)).lstrip('/')
     return href
 
+# ── Link Helpers ─────────────────────────────────────────────────────────────
+def is_external_url(href):
+    """Return True if the href is an absolute external URL."""
+    return href and (href.startswith('http://') or href.startswith('https://') or href.startswith('mailto:'))
+
+def escape_xml(text):
+    """Escape characters that are special in ReportLab's para XML."""
+    return (text
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;')
+            .replace('"', '&quot;'))
+
+def build_linked_text(node, base_url_map=None):
+    """
+    Walk a BS4 node and return a ReportLab-compatible XML string that
+    preserves <a href> as <link href="..."> for external URLs, or as
+    plain underlined text for internal anchors.
+    """
+    parts = []
+    for child in node.descendants if hasattr(node, 'descendants') else []:
+        # Only process direct-child text and <a> tags at any depth;
+        # we'll reconstruct the string manually.
+        pass
+
+    # Simpler approach: render the whole node with inline link markup
+    def render(n):
+        if isinstance(n, NavigableString):
+            return escape_xml(str(n))
+        tag = (n.name or '').lower()
+        if tag == 'a':
+            href = (n.get('href') or '').strip()
+            text = escape_xml(n.get_text())
+            if not text:
+                return ''
+            if is_external_url(href):
+                # External link → clickable blue underlined
+                return f'<link href="{escape_xml(href)}" color="blue"><u>{text}</u></link>'
+            elif href.startswith('#') or (href and not href.startswith('http')):
+                # Internal/chapter link → underlined, no external URL
+                return f'<u>{text}</u>'
+            else:
+                return text
+        elif tag in ('b', 'strong'):
+            inner = ''.join(render(c) for c in n.children)
+            return f'<b>{inner}</b>' if inner else ''
+        elif tag in ('i', 'em'):
+            inner = ''.join(render(c) for c in n.children)
+            return f'<i>{inner}</i>' if inner else ''
+        elif tag in ('u',):
+            inner = ''.join(render(c) for c in n.children)
+            return f'<u>{inner}</u>' if inner else ''
+        elif tag == 'br':
+            return '<br/>'
+        elif tag in ('script', 'style', 'img', 'svg'):
+            return ''
+        else:
+            return ''.join(render(c) for c in n.children)
+
+    return render(node)
+
+
 # ── EPUB Parsing ─────────────────────────────────────────────────────────────
 def parse_epub(epub_bytes):
     chapters, title, author = [], 'Untitled', ''
@@ -82,6 +137,7 @@ def parse_epub(epub_bytes):
     with zipfile.ZipFile(io.BytesIO(epub_bytes)) as z:
         names_set = set(z.namelist())
 
+        # Load all images eagerly
         IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
         for name in z.namelist():
             if os.path.splitext(name)[1].lower() in IMAGE_EXTS:
@@ -90,6 +146,7 @@ def parse_epub(epub_bytes):
                 except Exception:
                     pass
 
+        # container.xml -> OPF
         opf_path = None
         if 'META-INF/container.xml' in names_set:
             soup = BeautifulSoup(
@@ -189,19 +246,25 @@ def parse_html_chapter(html_content, chapter_base, image_map):
                 return k
         return None
 
+    def node_has_links(node):
+        """Check if a node contains any <a href> tags."""
+        return bool(node.find('a', href=True))
+
     def process(node, list_depth=0):
         if isinstance(node, NavigableString):
             t = str(node).strip()
             if t:
-                elements.append({'type': 'para', 'text': t, 'align': None})
+                elements.append({'type': 'para', 'text': escape_xml(t), 'align': None, 'rich': False})
             return
 
         tag = (node.name or '').lower()
         style_attr = node.get('style', '') if hasattr(node, 'get') else ''
 
+        # Page break
         if 'page-break-before: always' in style_attr or 'break-before: page' in style_attr:
             elements.append({'type': 'pagebreak'})
 
+        # Image
         if tag == 'img':
             src = node.get('src') or node.get('data-src') or ''
             path = resolve_src(src)
@@ -228,38 +291,66 @@ def parse_html_chapter(html_content, chapter_base, image_map):
 
         if tag == 'figcaption':
             t = node.get_text(separator=' ', strip=True)
-            if t: elements.append({'type':'caption','text':t})
+            if t: elements.append({'type':'caption','text':escape_xml(t), 'rich': False})
             return
 
         if tag in ('h1','h2','h3','h4','h5','h6'):
             for img in node.find_all('img'): process(img, list_depth)
-            t = node.get_text(separator=' ', strip=True)
-            if t: elements.append({'type':'heading','level':int(tag[1]),'text':t})
+            # Headings: preserve links inside headings too
+            if node_has_links(node):
+                rich_text = build_linked_text(node)
+                if rich_text.strip():
+                    elements.append({'type':'heading','level':int(tag[1]),'text':rich_text,'rich':True})
+            else:
+                t = node.get_text(separator=' ', strip=True)
+                if t: elements.append({'type':'heading','level':int(tag[1]),'text':escape_xml(t),'rich':False})
             return
 
         if tag == 'p':
             imgs = node.find_all('img')
             for img in imgs: process(img, list_depth)
             for img in imgs: img.decompose()
-            t = node.get_text(separator=' ', strip=True)
-            if t: elements.append({'type':'para','text':t,'align':get_align(node)})
+
+            if node_has_links(node):
+                # Rich path: preserve link markup
+                rich_text = build_linked_text(node)
+                if rich_text.strip():
+                    elements.append({'type':'para','text':rich_text,'align':get_align(node),'rich':True})
+            else:
+                t = node.get_text(separator=' ', strip=True)
+                if t: elements.append({'type':'para','text':escape_xml(t),'align':get_align(node),'rich':False})
             return
 
         if tag == 'blockquote':
-            t = node.get_text(separator=' ', strip=True)
-            if t: elements.append({'type':'blockquote','text':t})
+            if node_has_links(node):
+                rich_text = build_linked_text(node)
+                if rich_text.strip():
+                    elements.append({'type':'blockquote','text':rich_text,'rich':True})
+            else:
+                t = node.get_text(separator=' ', strip=True)
+                if t: elements.append({'type':'blockquote','text':escape_xml(t),'rich':False})
             return
 
         if tag in ('ul','ol'):
             for i, li in enumerate(node.find_all('li', recursive=False)):
                 bullet = f'{i+1}.' if tag == 'ol' else '•'
-                t = li.get_text(separator=' ', strip=True)
-                if t: elements.append({'type':'li','text':f'{bullet} {t}','depth':list_depth})
+                if node_has_links(li):
+                    rich_text = build_linked_text(li)
+                    if rich_text.strip():
+                        elements.append({'type':'li','text':f'{bullet} {rich_text}','depth':list_depth,'rich':True})
+                else:
+                    t = li.get_text(separator=' ', strip=True)
+                    if t: elements.append({'type':'li','text':escape_xml(f'{bullet} {t}'),'depth':list_depth,'rich':False})
             return
 
         if tag == 'li':
-            t = node.get_text(separator=' ', strip=True)
-            if t: elements.append({'type':'li','text':f'• {t}','depth':list_depth})
+            if node_has_links(node):
+                rich_text = build_linked_text(node)
+                if rich_text.strip():
+                    elements.append({'type':'li','text':f'• {rich_text}','depth':list_depth,'rich':True})
+            else:
+                t = node.get_text(separator=' ', strip=True)
+                if t: elements.append({'type':'li','text':escape_xml(f'• {t}'),'depth':list_depth,'rich':False})
             return
 
         if tag == 'hr':
@@ -272,9 +363,10 @@ def parse_html_chapter(html_content, chapter_base, image_map):
                          for td in row.find_all(['td','th'])]
                 line = '  |  '.join(c for c in cells if c)
                 if line.strip():
-                    elements.append({'type':'para','text':line,'align':None})
+                    elements.append({'type':'para','text':escape_xml(line),'align':None,'rich':False})
             return
 
+        # generic containers
         cls = ' '.join(node.get('class', [])) if hasattr(node, 'get') else ''
         if 'pagebreak' in cls or 'page-break' in cls:
             elements.append({'type':'pagebreak'})
@@ -287,10 +379,11 @@ def parse_html_chapter(html_content, chapter_base, image_map):
                 process(child, list_depth)
             return
 
+        # fallback
         for img in node.find_all('img'): process(img, list_depth)
         for img in node.find_all('img'): img.decompose()
         t = node.get_text(separator=' ', strip=True)
-        if t: elements.append({'type':'para','text':t,'align':None})
+        if t: elements.append({'type':'para','text':escape_xml(t),'align':None,'rich':False})
 
     for child in body.children:
         process(child)
@@ -313,8 +406,6 @@ def build_pdf(title, author, chapters, image_map):
     def base_font(variant='regular'):
         if not is_cjk:
             return {'bold':FONT_EN_BOLD,'italic':FONT_EN_ITALIC}.get(variant, FONT_EN_REGULAR)
-        # For CJK, all variants map to the same embedded font
-        # (WQY/IPA don't have bold/italic variants available as separate TTF here)
         return {'tc':FONT_TC,'sc':FONT_SC,'ja':FONT_JA,'ko':FONT_KO}[dom]
 
     lm = 1.72 if is_cjk else 1.55
@@ -349,13 +440,19 @@ def build_pdf(title, author, chapters, image_map):
                    alignment=TA_CENTER, spaceBefore=2, spaceAfter=10)
 
     def best_font_for(text, base_style_font):
-        if not has_non_latin(text):
+        # Strip XML tags for script detection
+        plain = re.sub(r'<[^>]+>', '', text)
+        if not has_non_latin(plain):
             return base_style_font
-        sc = detect_script(text)
+        sc = detect_script(plain)
         return SCRIPT_FONTS.get(sc, base_style_font)
 
-    def safe_para(text, style):
-        text = text.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+    def safe_para(text, style, is_rich=False):
+        """
+        Build a Paragraph.
+        - is_rich=True  → text already contains XML markup (links, bold, etc.)
+        - is_rich=False → text is plain (already XML-escaped), wrap as-is
+        """
         needed = best_font_for(text, style.fontName)
         if needed != style.fontName:
             style = ParagraphStyle(style.name+'_x', parent=style,
@@ -363,10 +460,15 @@ def build_pdf(title, author, chapters, image_map):
         try:
             return Paragraph(text, style)
         except Exception:
+            # Fallback: strip all markup and try plain ASCII
+            plain = re.sub(r'<[^>]+>', '', text)
             try:
-                return Paragraph(text.encode('ascii','replace').decode(), style)
+                return Paragraph(escape_xml(plain), style)
             except Exception:
-                return Spacer(1, 0)
+                try:
+                    return Paragraph(plain.encode('ascii','replace').decode(), style)
+                except Exception:
+                    return Spacer(1, 0)
 
     def make_image_flowable(el):
         path   = el.get('path','')
@@ -383,6 +485,7 @@ def build_pdf(title, author, chapters, image_map):
             if orig_w == 0 or orig_h == 0:
                 return None
 
+            # Normalise mode/format for ReportLab
             if pil.mode in ('P','RGBA','LA') or (pil.format or '').upper() in ('WEBP','GIF'):
                 bg = PILImage.new('RGB', pil.size, (255,255,255))
                 src = pil.convert('RGBA')
@@ -414,6 +517,7 @@ def build_pdf(title, author, chapters, image_map):
                 draw_w = orig_w * scale
                 draw_h = orig_h * scale
 
+            # Final height guard
             if draw_h > max_h:
                 draw_w *= max_h / draw_h
                 draw_h  = max_h
@@ -425,9 +529,9 @@ def build_pdf(title, author, chapters, image_map):
 
     # ── Story assembly ────────────────────────────────────────────────────────
     story = [Spacer(1, 1.8*cm)]
-    story.append(safe_para(title or 'Untitled', s_title))
+    story.append(safe_para(escape_xml(title or 'Untitled'), s_title))
     if author:
-        story.append(safe_para(author, s_author))
+        story.append(safe_para(escape_xml(author), s_author))
     story.append(HRFlowable(width='55%', thickness=1,
                              color=colors.HexColor('#c8882a'), hAlign='CENTER'))
     story.append(PageBreak())
@@ -439,10 +543,11 @@ def build_pdf(title, author, chapters, image_map):
         while i < len(chapter_elements):
             el = chapter_elements[i]
             etype = el.get('type','')
+            is_rich = el.get('rich', False)
 
             if etype == 'heading':
                 lvl = max(1, min(6, el.get('level', 1)))
-                story.append(safe_para(el['text'], s_h[lvl]))
+                story.append(safe_para(el['text'], s_h[lvl], is_rich))
 
             elif etype == 'para':
                 text = el.get('text','').strip()
@@ -454,15 +559,15 @@ def build_pdf(title, author, chapters, image_map):
                         style = ParagraphStyle('br', parent=s_body, alignment=TA_RIGHT, firstLineIndent=0)
                     else:
                         style = s_body
-                    story.append(safe_para(text, style))
+                    story.append(safe_para(text, style, is_rich))
 
             elif etype == 'blockquote':
-                story.append(safe_para(el['text'], s_bq))
+                story.append(safe_para(el['text'], s_bq, is_rich))
 
             elif etype == 'li':
                 indent = el.get('depth', 0) * 10
                 li_style = ParagraphStyle('lid', parent=s_li, leftIndent=16+indent)
-                story.append(safe_para(el['text'], li_style))
+                story.append(safe_para(el['text'], li_style, is_rich))
 
             elif etype == 'hr':
                 story += [Spacer(1,4),
@@ -475,20 +580,21 @@ def build_pdf(title, author, chapters, image_map):
 
             elif etype == 'img':
                 img_flow = make_image_flowable(el)
+                # Peek for caption
                 next_el = chapter_elements[i+1] if i+1 < len(chapter_elements) else None
                 has_caption = next_el and next_el.get('type') == 'caption'
 
                 if img_flow:
                     block = [Spacer(1, 8), img_flow, Spacer(1, 4)]
                     if has_caption:
-                        block.append(safe_para(next_el['text'], s_caption))
+                        block.append(safe_para(next_el['text'], s_caption, next_el.get('rich', False)))
                         i += 1
                     story.append(KeepTogether(block))
                 elif has_caption:
-                    i += 1
+                    i += 1  # skip orphaned caption
 
             elif etype == 'caption':
-                story.append(safe_para(el['text'], s_caption))
+                story.append(safe_para(el['text'], s_caption, is_rich))
 
             i += 1
 
@@ -582,7 +688,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
 <div class="masthead">
   <div class="rule"></div>
   <h1>EPUB <span>&#8594;</span> PDF</h1>
-  <p class="subtitle">Multilingual eBook converter &middot; Images &amp; Layout Preserved</p>
+  <p class="subtitle">Multilingual eBook converter &middot; Images, Layout &amp; Links Preserved</p>
   <div class="lang-badges">
     <span class="badge">&#127468;&#127463; English</span>
     <span class="badge">&#127481;&#127484; &#32321;&#39636;&#20013;&#25991;</span>
@@ -590,6 +696,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
     <span class="badge">&#127471;&#127477; &#26085;&#26412;&#35486;</span>
     <span class="badge">&#127472;&#127479; &#54620;&#44397;&#50612;</span>
     <span class="badge">&#128444; Images</span>
+    <span class="badge">&#128279; Links</span>
     <span class="badge">&#128208; Layout</span>
   </div>
   <div class="rule" style="margin-top:1.2rem"></div>
@@ -632,7 +739,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
 
 <p class="footer-note">
   <span class="ornament">&#10022;</span>
-  Auto-detects language &middot; Preserves images &amp; layout &middot; No data retained
+  Auto-detects language &middot; Preserves images, layout &amp; hyperlinks &middot; No data retained
   <span class="ornament">&#10022;</span>
 </p>
 
@@ -676,7 +783,7 @@ async function convertFile(){
     const url=URL.createObjectURL(blob);
     const base=selectedFile.name.replace(/\.epub$/i,'');
     resultBox.className='result-box success';
-    resultBox.innerHTML='<strong>&#10003; Conversion successful!</strong><br>Images and layout preserved.<br>'
+    resultBox.innerHTML='<strong>&#10003; Conversion successful!</strong><br>Images, layout &amp; links preserved.<br>'
       +'<a class="btn-download" href="'+url+'" download="'+base+'.pdf">'
       +'&#8659;&nbsp;&nbsp;Download PDF</a>';
   }catch(err){
