@@ -159,7 +159,12 @@ def parse_html_chapter(html_content, chapter_base, image_map):
         if not m:
             return None
         v, u = float(m.group(1)), (m.group(2) or 'px')
-        return {'px':0.75,'pt':1.0,'em':12.0,'rem':12.0,'cm':28.35,'mm':2.835,'in':72.0}.get(u)
+        if u == '%':
+            return None  # percentages can't be converted without context
+        factor = {'px':0.75,'pt':1.0,'em':12.0,'rem':12.0,'cm':28.35,'mm':2.835,'in':72.0}.get(u)
+        if factor is None:
+            return None
+        return v * factor
 
     def get_align(node):
         style = node.get('style', '') if hasattr(node, 'get') else ''
@@ -193,18 +198,31 @@ def parse_html_chapter(html_content, chapter_base, image_map):
             if src:
                 path = resolve_src(src)
                 if path:
-                    # Try to get dimensions from SVG viewBox or image attributes
-                    w_hint = css_to_pt(img_tag.get('width'))
-                    h_hint = css_to_pt(img_tag.get('height'))
-                    # Also check viewBox on the parent SVG for aspect ratio
+                    w_hint = None
+                    h_hint = None
+
+                    # 1) Prefer viewBox on the parent SVG (most reliable for aspect ratio)
                     viewbox = svg_node.get('viewbox') or svg_node.get('viewBox') or ''
                     vb_parts = viewbox.split()
-                    if len(vb_parts) == 4 and not w_hint and not h_hint:
+                    if len(vb_parts) == 4:
                         try:
-                            w_hint = float(vb_parts[2]) * 0.75  # px to pt approx
+                            w_hint = float(vb_parts[2]) * 0.75  # px to pt
                             h_hint = float(vb_parts[3]) * 0.75
                         except (ValueError, IndexError):
                             pass
+
+                    # 2) Fall back to <image> width/height if no viewBox
+                    #    but skip percentage values (e.g. "100%")
+                    if not w_hint or not h_hint:
+                        raw_w = img_tag.get('width', '')
+                        raw_h = img_tag.get('height', '')
+                        if raw_w and '%' not in str(raw_w):
+                            w_hint = css_to_pt(raw_w)
+                        if raw_h and '%' not in str(raw_h):
+                            h_hint = h_hint or css_to_pt(raw_h)
+
+                    # Return None for hints to let make_image_flowable
+                    # use the actual image dimensions
                     return {
                         'type': 'img', 'path': path, 'alt': '',
                         'align': 'center',
