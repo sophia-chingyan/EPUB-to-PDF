@@ -4,7 +4,10 @@ import zipfile
 import re
 import posixpath
 from flask import Flask, request, send_file, jsonify, render_template_string
-from bs4 import BeautifulSoup, NavigableString
+import warnings
+from bs4 import BeautifulSoup, NavigableString, Comment
+from bs4 import XMLParsedAsHTMLWarning
+warnings.filterwarnings('ignore', category=XMLParsedAsHTMLWarning)
 from PIL import Image as PILImage
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
@@ -94,6 +97,8 @@ def get_rich_text(node, base_font_name='Times-Roman'):
     parts = []
 
     for child in node.children:
+        if isinstance(child, Comment):
+            continue  # skip HTML comments
         if isinstance(child, NavigableString):
             t = str(child)
             if t:
@@ -310,6 +315,8 @@ def parse_html_chapter(html_content, chapter_base, image_map):
         return None
 
     def process(node, list_depth=0):
+        if isinstance(node, Comment):
+            return  # skip HTML comments entirely
         if isinstance(node, NavigableString):
             t = str(node).strip()
             if t:
@@ -403,11 +410,12 @@ def parse_html_chapter(html_content, chapter_base, image_map):
 
         if tag == 'table':
             for row in node.find_all('tr'):
-                cells = [td.get_text(separator=' ', strip=True)
+                cells = [get_rich_text(td)
                          for td in row.find_all(['td', 'th'])]
-                line = '  |  '.join(c for c in cells if c)
-                if line.strip():
-                    elements.append({'type': 'para', 'text': xml_escape(line),
+                cells = [c.strip() for c in cells if c.strip()]
+                if cells:
+                    line = '  |  '.join(cells)
+                    elements.append({'type': 'para', 'text': line,
                                       'rich': True, 'align': None})
             return
 
