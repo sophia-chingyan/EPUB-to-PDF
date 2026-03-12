@@ -19,12 +19,11 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
 # ── Font Registration ────────────────────────────────────────────────────────
-# Embedded TTF fonts – works in all PDF readers (no CID dependency)
 _WQY_PATH = '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc'
 _IPA_PATH  = '/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf'
 
-pdfmetrics.registerFont(TTFont('WenQuanYi',  _WQY_PATH, subfontIndex=0))
-pdfmetrics.registerFont(TTFont('IPAGothic',  _IPA_PATH))
+pdfmetrics.registerFont(TTFont('WenQuanYi', _WQY_PATH, subfontIndex=0))
+pdfmetrics.registerFont(TTFont('IPAGothic', _IPA_PATH))
 
 FONT_EN_REGULAR = 'Times-Roman'
 FONT_EN_BOLD    = 'Times-Bold'
@@ -38,6 +37,9 @@ PAGE_W, PAGE_H = A4
 MARGIN_L = MARGIN_R = 3.2 * cm
 MARGIN_T = MARGIN_B = 3.0 * cm
 CONTENT_W = PAGE_W - MARGIN_L - MARGIN_R
+
+LINK_COLOR = '#1a5fa8'   # blue for external hyperlinks
+ILINK_COLOR = '#6b5c44'  # muted brown for internal EPUB links
 
 # ── Script Detection ─────────────────────────────────────────────────────────
 def detect_script(text):
@@ -66,6 +68,101 @@ def resolve_path(base_dir, href):
         return posixpath.normpath(posixpath.join(base_dir, href)).lstrip('/')
     return href
 
+def is_external_url(href):
+    return href.startswith(('http://', 'https://', 'mailto:', 'ftp://'))
+
+def xml_escape(text):
+    """Escape text for use inside ReportLab XML paragraph markup."""
+    return (text
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;')
+            .replace('"', '&quot;'))
+
+# ── Rich Text Builder ─────────────────────────────────────────────────────────
+def get_rich_text(node, base_font_name='Times-Roman'):
+    """
+    Recursively build a ReportLab-compatible XML string from an HTML node.
+    Preserves:
+      - External hyperlinks  → <a href="https://..." color="#1a5fa8">text</a>
+      - Internal EPUB links  → styled text only (no PDF anchor; colour hint)
+      - Bold / strong        → <b>text</b>
+      - Italic / em          → <i>text</i>
+      - Underline            → <u>text</u>
+    Plain text is XML-escaped; markup tags are emitted as literals.
+    """
+    parts = []
+
+    for child in node.children:
+        if isinstance(child, NavigableString):
+            t = str(child)
+            if t:
+                parts.append(xml_escape(t))
+            continue
+
+        tag = (child.name or '').lower()
+
+        if tag == 'a':
+            href = (child.get('href') or '').strip()
+            inner = get_rich_text(child, base_font_name)
+            if not inner.strip():
+                continue
+            if href and is_external_url(href):
+                # Clickable PDF hyperlink
+                safe_href = xml_escape(href)
+                parts.append(
+                    f'<a href="{safe_href}" color="{LINK_COLOR}">'
+                    f'<u>{inner}</u></a>'
+                )
+            elif href and not href.startswith('#'):
+                # Internal EPUB cross-ref: render as coloured text, not clickable
+                parts.append(
+                    f'<font color="{ILINK_COLOR}"><u>{inner}</u></font>'
+                )
+            else:
+                # Anchor-only (#id) or empty href — plain text
+                parts.append(inner)
+
+        elif tag in ('strong', 'b'):
+            inner = get_rich_text(child, base_font_name)
+            if inner.strip():
+                parts.append(f'<b>{inner}</b>')
+
+        elif tag in ('em', 'i'):
+            inner = get_rich_text(child, base_font_name)
+            if inner.strip():
+                parts.append(f'<i>{inner}</i>')
+
+        elif tag == 'u':
+            inner = get_rich_text(child, base_font_name)
+            if inner.strip():
+                parts.append(f'<u>{inner}</u>')
+
+        elif tag in ('span', 'small', 'big', 'font', 'abbr', 'cite',
+                     'code', 'kbd', 'samp', 'var', 'mark', 'sub', 'sup',
+                     'bdi', 'bdo', 'q', 'ruby', 'rt', 'rp', 'time',
+                     'data', 'dfn'):
+            # Inline containers — recurse
+            inner = get_rich_text(child, base_font_name)
+            if inner.strip():
+                parts.append(inner)
+
+        elif tag == 'br':
+            parts.append('<br/>')
+
+        elif tag == 'img':
+            # Images are handled at element level; skip inside rich text
+            pass
+
+        else:
+            # Block-level or unknown: grab plain text so we don't lose content
+            t = child.get_text(separator=' ', strip=True)
+            if t:
+                parts.append(xml_escape(t))
+
+    return ''.join(parts)
+
+
 # ── EPUB Parsing ─────────────────────────────────────────────────────────────
 def parse_epub(epub_bytes):
     chapters, title, author = [], 'Untitled', ''
@@ -74,7 +171,6 @@ def parse_epub(epub_bytes):
     with zipfile.ZipFile(io.BytesIO(epub_bytes)) as z:
         names_set = set(z.namelist())
 
-        # Load all images eagerly
         IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
         for name in z.namelist():
             if os.path.splitext(name)[1].lower() in IMAGE_EXTS:
@@ -83,7 +179,6 @@ def parse_epub(epub_bytes):
                 except Exception:
                     pass
 
-        # container.xml -> OPF
         opf_path = None
         if 'META-INF/container.xml' in names_set:
             soup = BeautifulSoup(
@@ -159,18 +254,17 @@ def parse_html_chapter(html_content, chapter_base, image_map):
             return None
         v, u = float(m.group(1)), (m.group(2) or 'px')
         if u == '%':
-            return None  # percentages can't be converted without context
-        factor = {'px':0.75,'pt':1.0,'em':12.0,'rem':12.0,'cm':28.35,'mm':2.835,'in':72.0}.get(u)
-        if factor is None:
             return None
-        return v * factor
+        factor = {'px': 0.75, 'pt': 1.0, 'em': 12.0, 'rem': 12.0,
+                  'cm': 28.35, 'mm': 2.835, 'in': 72.0}.get(u)
+        return v * factor if factor else None
 
     def get_align(node):
         style = node.get('style', '') if hasattr(node, 'get') else ''
         cls   = ' '.join(node.get('class', [])) if hasattr(node, 'get') else ''
         m = re.search(r'text-align\s*:\s*(\w+)', style)
         if m: return m.group(1)
-        for kw in ('center','right','left','justify'):
+        for kw in ('center', 'right', 'left', 'justify'):
             if kw in cls.lower(): return kw
         return None
 
@@ -189,61 +283,46 @@ def parse_html_chapter(html_content, chapter_base, image_map):
         return None
 
     def extract_svg_image(svg_node):
-        """Extract image reference from SVG <image> tags (xlink:href or href)."""
         for img_tag in svg_node.find_all('image'):
-            # Try xlink:href first, then href
             src = (img_tag.get('xlink:href') or img_tag.get('href') or
                    img_tag.get('{http://www.w3.org/1999/xlink}href') or '')
             if src:
                 path = resolve_src(src)
                 if path:
-                    w_hint = None
-                    h_hint = None
-
-                    # 1) Prefer viewBox on the parent SVG (most reliable for aspect ratio)
+                    w_hint = h_hint = None
                     viewbox = svg_node.get('viewbox') or svg_node.get('viewBox') or ''
                     vb_parts = viewbox.split()
                     if len(vb_parts) == 4:
                         try:
-                            w_hint = float(vb_parts[2]) * 0.75  # px to pt
+                            w_hint = float(vb_parts[2]) * 0.75
                             h_hint = float(vb_parts[3]) * 0.75
                         except (ValueError, IndexError):
                             pass
-
-                    # 2) Fall back to <image> width/height if no viewBox
-                    #    but skip percentage values (e.g. "100%")
                     if not w_hint or not h_hint:
                         raw_w = img_tag.get('width', '')
                         raw_h = img_tag.get('height', '')
                         if raw_w and '%' not in str(raw_w):
                             w_hint = css_to_pt(raw_w)
                         if raw_h and '%' not in str(raw_h):
-                            h_hint = h_hint or css_to_pt(raw_h)
-
-                    # Return None for hints to let make_image_flowable
-                    # use the actual image dimensions
-                    return {
-                        'type': 'img', 'path': path, 'alt': '',
-                        'align': 'center',
-                        'width_hint': w_hint, 'height_hint': h_hint
-                    }
+                            h_hint = css_to_pt(raw_h)
+                    return {'type': 'img', 'path': path, 'alt': '',
+                            'align': 'center', 'width_hint': w_hint, 'height_hint': h_hint}
         return None
 
     def process(node, list_depth=0):
         if isinstance(node, NavigableString):
             t = str(node).strip()
             if t:
-                elements.append({'type': 'para', 'text': t, 'align': None})
+                elements.append({'type': 'para', 'text': xml_escape(t),
+                                  'rich': True, 'align': None})
             return
 
         tag = (node.name or '').lower()
         style_attr = node.get('style', '') if hasattr(node, 'get') else ''
 
-        # Page break
         if 'page-break-before: always' in style_attr or 'break-before: page' in style_attr:
             elements.append({'type': 'pagebreak'})
 
-        # Image
         if tag == 'img':
             src = node.get('src') or node.get('data-src') or ''
             path = resolve_src(src)
@@ -257,12 +336,11 @@ def parse_html_chapter(html_content, chapter_base, image_map):
                     hm = re.search(r'height\s*:\s*([^;]+)', style_attr)
                     if hm: h_hint = css_to_pt(hm.group(1))
                 parent_align = get_align(node.parent) if node.parent else None
-                elements.append({'type':'img','path':path,'alt':node.get('alt',''),
+                elements.append({'type': 'img', 'path': path, 'alt': node.get('alt', ''),
                                   'align': parent_align or 'center',
                                   'width_hint': w_hint, 'height_hint': h_hint})
             return
 
-        # SVG: extract embedded <image> references instead of skipping
         if tag == 'svg':
             img_el = extract_svg_image(node)
             if img_el:
@@ -275,74 +353,82 @@ def parse_html_chapter(html_content, chapter_base, image_map):
 
         if tag == 'figcaption':
             t = node.get_text(separator=' ', strip=True)
-            if t: elements.append({'type':'caption','text':t})
+            if t: elements.append({'type': 'caption', 'text': xml_escape(t), 'rich': True})
             return
 
-        if tag in ('h1','h2','h3','h4','h5','h6'):
+        if tag in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
             for img in node.find_all('img'): process(img, list_depth)
-            t = node.get_text(separator=' ', strip=True)
-            if t: elements.append({'type':'heading','level':int(tag[1]),'text':t})
+            # Build rich heading text (preserves inline links/bold/italic)
+            rt = get_rich_text(node)
+            if rt.strip():
+                elements.append({'type': 'heading', 'level': int(tag[1]),
+                                  'text': rt, 'rich': True})
             return
 
         if tag == 'p':
             imgs = node.find_all('img')
             for img in imgs: process(img, list_depth)
             for img in imgs: img.decompose()
-            t = node.get_text(separator=' ', strip=True)
-            if t: elements.append({'type':'para','text':t,'align':get_align(node)})
+            rt = get_rich_text(node)
+            if rt.strip():
+                elements.append({'type': 'para', 'text': rt,
+                                  'rich': True, 'align': get_align(node)})
             return
 
         if tag == 'blockquote':
-            t = node.get_text(separator=' ', strip=True)
-            if t: elements.append({'type':'blockquote','text':t})
+            rt = get_rich_text(node)
+            if rt.strip():
+                elements.append({'type': 'blockquote', 'text': rt, 'rich': True})
             return
 
-        if tag in ('ul','ol'):
+        if tag in ('ul', 'ol'):
             for i, li in enumerate(node.find_all('li', recursive=False)):
                 bullet = f'{i+1}.' if tag == 'ol' else '•'
-                t = li.get_text(separator=' ', strip=True)
-                if t: elements.append({'type':'li','text':f'{bullet} {t}','depth':list_depth})
+                rt = get_rich_text(li)
+                if rt.strip():
+                    elements.append({'type': 'li', 'text': f'{bullet} {rt}',
+                                      'rich': True, 'depth': list_depth})
             return
 
         if tag == 'li':
-            t = node.get_text(separator=' ', strip=True)
-            if t: elements.append({'type':'li','text':f'• {t}','depth':list_depth})
+            rt = get_rich_text(node)
+            if rt.strip():
+                elements.append({'type': 'li', 'text': f'• {rt}',
+                                  'rich': True, 'depth': list_depth})
             return
 
         if tag == 'hr':
-            elements.append({'type':'hr'})
+            elements.append({'type': 'hr'})
             return
 
         if tag == 'table':
             for row in node.find_all('tr'):
                 cells = [td.get_text(separator=' ', strip=True)
-                         for td in row.find_all(['td','th'])]
+                         for td in row.find_all(['td', 'th'])]
                 line = '  |  '.join(c for c in cells if c)
                 if line.strip():
-                    elements.append({'type':'para','text':line,'align':None})
+                    elements.append({'type': 'para', 'text': xml_escape(line),
+                                      'rich': True, 'align': None})
             return
 
-        # generic containers
         cls = ' '.join(node.get('class', [])) if hasattr(node, 'get') else ''
         if 'pagebreak' in cls or 'page-break' in cls:
-            elements.append({'type':'pagebreak'})
+            elements.append({'type': 'pagebreak'})
             return
 
-        # Handle ops:switch / ops:case — descend into children to find SVGs
         if tag in ('ops:switch', 'ops:case', 'ops:default', 'switch', 'case'):
             for child in node.children:
                 process(child, list_depth)
             return
 
-        if tag in ('div','section','article','main','header','footer','body',
-                   'span','a','em','strong','i','b','u','small','big',
-                   'center','font',None,''):
+        if tag in ('div', 'section', 'article', 'main', 'header', 'footer', 'body',
+                   'span', 'a', 'em', 'strong', 'i', 'b', 'u', 'small', 'big',
+                   'center', 'font', None, ''):
             for child in node.children:
                 process(child, list_depth)
             return
 
         # fallback
-        # Check for SVG images inside unknown containers
         for svg in node.find_all('svg'):
             img_el = extract_svg_image(svg)
             if img_el:
@@ -351,8 +437,9 @@ def parse_html_chapter(html_content, chapter_base, image_map):
             svg.decompose()
         for img in node.find_all('img'): process(img, list_depth)
         for img in node.find_all('img'): img.decompose()
-        t = node.get_text(separator=' ', strip=True)
-        if t: elements.append({'type':'para','text':t,'align':None})
+        rt = get_rich_text(node)
+        if rt.strip():
+            elements.append({'type': 'para', 'text': rt, 'rich': True, 'align': None})
 
     for child in body.children:
         process(child)
@@ -367,22 +454,22 @@ def build_pdf(title, author, chapters, image_map):
     sample = [(title or ''), (author or '')]
     for ch in chapters[:5]:
         for el in (ch or [])[:80]:
-            if el.get('type') in ('para','heading','caption','li','blockquote'):
-                sample.append(el.get('text',''))
+            if el.get('type') in ('para', 'heading', 'caption', 'li', 'blockquote'):
+                sample.append(el.get('text', ''))
     dom = detect_script(' '.join(sample))
-    is_cjk = dom in ('tc','sc','ja','ko')
+    is_cjk = dom in ('tc', 'sc', 'ja', 'ko')
 
     def base_font(variant='regular'):
         if not is_cjk:
-            return {'bold':FONT_EN_BOLD,'italic':FONT_EN_ITALIC}.get(variant, FONT_EN_REGULAR)
-        return {'tc':FONT_TC,'sc':FONT_SC,'ja':FONT_JA,'ko':FONT_KO}[dom]
+            return {'bold': FONT_EN_BOLD, 'italic': FONT_EN_ITALIC}.get(variant, FONT_EN_REGULAR)
+        return {'tc': FONT_TC, 'sc': FONT_SC, 'ja': FONT_JA, 'ko': FONT_KO}[dom]
 
     lm = 1.72 if is_cjk else 1.55
 
     doc = SimpleDocTemplate(
         buf, pagesize=A4,
         leftMargin=MARGIN_L, rightMargin=MARGIN_R,
-        topMargin=MARGIN_T,  bottomMargin=MARGIN_B,
+        topMargin=MARGIN_T, bottomMargin=MARGIN_B,
         title=title, author=author,
     )
 
@@ -409,27 +496,42 @@ def build_pdf(title, author, chapters, image_map):
                    alignment=TA_CENTER, spaceBefore=2, spaceAfter=10)
 
     def best_font_for(text, base_style_font):
-        if not has_non_latin(text):
+        # Strip XML tags for script detection
+        plain = re.sub(r'<[^>]+>', '', text)
+        if not has_non_latin(plain):
             return base_style_font
-        sc = detect_script(text)
+        sc = detect_script(plain)
         return SCRIPT_FONTS.get(sc, base_style_font)
 
-    def safe_para(text, style):
-        text = text.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+    def safe_para(text, style, is_rich=False):
+        """
+        Build a ReportLab Paragraph.
+        - is_rich=True  → text already contains ReportLab XML markup; use as-is
+        - is_rich=False → plain text; XML-escape before use
+        """
+        if not is_rich:
+            text = xml_escape(text)
+
         needed = best_font_for(text, style.fontName)
         if needed != style.fontName:
-            style = ParagraphStyle(style.name+'_x', parent=style,
+            style = ParagraphStyle(style.name + '_x', parent=style,
                                    fontName=needed, leading=round(style.fontSize * 1.72))
         try:
             return Paragraph(text, style)
         except Exception:
+            # If markup is broken, fall back to plain escaped text
             try:
-                return Paragraph(text.encode('ascii','replace').decode(), style)
+                plain = re.sub(r'<[^>]+>', '', text)
+                return Paragraph(xml_escape(plain), style)
             except Exception:
-                return Spacer(1, 0)
+                try:
+                    return Paragraph(
+                        text.encode('ascii', 'replace').decode(), style)
+                except Exception:
+                    return Spacer(1, 0)
 
     def make_image_flowable(el):
-        path   = el.get('path','')
+        path   = el.get('path', '')
         align  = (el.get('align') or 'center').lower()
         w_hint = el.get('width_hint')
         h_hint = el.get('height_hint')
@@ -443,15 +545,14 @@ def build_pdf(title, author, chapters, image_map):
             if orig_w == 0 or orig_h == 0:
                 return None
 
-            # Normalise mode/format for ReportLab
-            if pil.mode in ('P','RGBA','LA') or (pil.format or '').upper() in ('WEBP','GIF'):
-                bg = PILImage.new('RGB', pil.size, (255,255,255))
+            if pil.mode in ('P', 'RGBA', 'LA') or (pil.format or '').upper() in ('WEBP', 'GIF'):
+                bg = PILImage.new('RGB', pil.size, (255, 255, 255))
                 src = pil.convert('RGBA')
                 bg.paste(src, mask=src.split()[3] if src.mode == 'RGBA' else None)
                 tmp = io.BytesIO()
                 bg.save(tmp, format='PNG')
                 img_bytes = tmp.getvalue()
-            elif pil.mode not in ('RGB','L'):
+            elif pil.mode not in ('RGB', 'L'):
                 pil2 = pil.convert('RGB')
                 tmp = io.BytesIO()
                 pil2.save(tmp, format='PNG')
@@ -475,18 +576,17 @@ def build_pdf(title, author, chapters, image_map):
                 draw_w = orig_w * scale
                 draw_h = orig_h * scale
 
-            # Final height guard
             if draw_h > max_h:
                 draw_w *= max_h / draw_h
                 draw_h  = max_h
 
-            rl_align = {'left':'LEFT','right':'RIGHT'}.get(align,'CENTER')
+            rl_align = {'left': 'LEFT', 'right': 'RIGHT'}.get(align, 'CENTER')
             return RLImage(io.BytesIO(img_bytes), width=draw_w, height=draw_h, hAlign=rl_align)
         except Exception:
             return None
 
     # ── Story assembly ────────────────────────────────────────────────────────
-    story = [Spacer(1, 1.8*cm)]
+    story = [Spacer(1, 1.8 * cm)]
     story.append(safe_para(title or 'Untitled', s_title))
     if author:
         story.append(safe_para(author, s_author))
@@ -500,14 +600,15 @@ def build_pdf(title, author, chapters, image_map):
         i = 0
         while i < len(chapter_elements):
             el = chapter_elements[i]
-            etype = el.get('type','')
+            etype = el.get('type', '')
+            is_rich = el.get('rich', False)
 
             if etype == 'heading':
                 lvl = max(1, min(6, el.get('level', 1)))
-                story.append(safe_para(el['text'], s_h[lvl]))
+                story.append(safe_para(el['text'], s_h[lvl], is_rich=is_rich))
 
             elif etype == 'para':
-                text = el.get('text','').strip()
+                text = el.get('text', '').strip()
                 if text:
                     align = el.get('align')
                     if align == 'center':
@@ -516,42 +617,42 @@ def build_pdf(title, author, chapters, image_map):
                         style = ParagraphStyle('br', parent=s_body, alignment=TA_RIGHT, firstLineIndent=0)
                     else:
                         style = s_body
-                    story.append(safe_para(text, style))
+                    story.append(safe_para(text, style, is_rich=is_rich))
 
             elif etype == 'blockquote':
-                story.append(safe_para(el['text'], s_bq))
+                story.append(safe_para(el['text'], s_bq, is_rich=is_rich))
 
             elif etype == 'li':
                 indent = el.get('depth', 0) * 10
-                li_style = ParagraphStyle('lid', parent=s_li, leftIndent=16+indent)
-                story.append(safe_para(el['text'], li_style))
+                li_style = ParagraphStyle('lid', parent=s_li, leftIndent=16 + indent)
+                story.append(safe_para(el['text'], li_style, is_rich=is_rich))
 
             elif etype == 'hr':
-                story += [Spacer(1,4),
-                           HRFlowable(width='35%',thickness=0.5,
-                                      color=colors.HexColor('#c8882a'),hAlign='CENTER'),
-                           Spacer(1,4)]
+                story += [Spacer(1, 4),
+                           HRFlowable(width='35%', thickness=0.5,
+                                      color=colors.HexColor('#c8882a'), hAlign='CENTER'),
+                           Spacer(1, 4)]
 
             elif etype == 'pagebreak':
                 story.append(PageBreak())
 
             elif etype == 'img':
                 img_flow = make_image_flowable(el)
-                # Peek for caption
-                next_el = chapter_elements[i+1] if i+1 < len(chapter_elements) else None
+                next_el = chapter_elements[i + 1] if i + 1 < len(chapter_elements) else None
                 has_caption = next_el and next_el.get('type') == 'caption'
 
                 if img_flow:
                     block = [Spacer(1, 8), img_flow, Spacer(1, 4)]
                     if has_caption:
-                        block.append(safe_para(next_el['text'], s_caption))
+                        block.append(safe_para(next_el['text'], s_caption,
+                                               is_rich=next_el.get('rich', False)))
                         i += 1
                     story.append(KeepTogether(block))
                 elif has_caption:
-                    i += 1  # skip orphaned caption
+                    i += 1
 
             elif etype == 'caption':
-                story.append(safe_para(el['text'], s_caption))
+                story.append(safe_para(el['text'], s_caption, is_rich=is_rich))
 
             i += 1
 
@@ -645,13 +746,14 @@ HTML_PAGE = r'''<!DOCTYPE html>
 <div class="masthead">
   <div class="rule"></div>
   <h1>EPUB <span>&#8594;</span> PDF</h1>
-  <p class="subtitle">Multilingual eBook converter &middot; Images &amp; Layout Preserved</p>
+  <p class="subtitle">Multilingual eBook converter &middot; Images, Links &amp; Layout Preserved</p>
   <div class="lang-badges">
     <span class="badge">&#127468;&#127463; English</span>
     <span class="badge">&#127481;&#127484; &#32321;&#39636;&#20013;&#25991;</span>
     <span class="badge">&#127464;&#127475; &#31616;&#20307;&#20013;&#25991;</span>
     <span class="badge">&#127471;&#127477; &#26085;&#26412;&#35486;</span>
     <span class="badge">&#127472;&#127479; &#54620;&#44397;&#50612;</span>
+    <span class="badge">&#128279; Hyperlinks</span>
     <span class="badge">&#128444; Images</span>
     <span class="badge">&#128208; Layout</span>
   </div>
@@ -695,7 +797,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
 
 <p class="footer-note">
   <span class="ornament">&#10022;</span>
-  Auto-detects language &middot; Preserves images &amp; layout &middot; No data retained
+  Auto-detects language &middot; Clickable hyperlinks &middot; Preserves images &amp; layout &middot; No data retained
   <span class="ornament">&#10022;</span>
 </p>
 
@@ -731,7 +833,7 @@ async function convertFile(){
   progressFill.style.width='0%';progressText.textContent='Uploading\u2026';animProg(28,900);
   const fd=new FormData();fd.append('file',selectedFile);
   try{
-    progressText.textContent='Parsing EPUB \u0026 images\u2026';animProg(55,1200);
+    progressText.textContent='Parsing EPUB \u0026 links\u2026';animProg(55,1200);
     const res=await fetch('/convert',{method:'POST',body:fd});
     progressText.textContent='Rendering PDF\u2026';animProg(88,800);
     if(!res.ok){const e=await res.json();throw new Error(e.error||'Conversion failed');}
@@ -739,7 +841,7 @@ async function convertFile(){
     const url=URL.createObjectURL(blob);
     const base=selectedFile.name.replace(/\.epub$/i,'');
     resultBox.className='result-box success';
-    resultBox.innerHTML='<strong>&#10003; Conversion successful!</strong><br>Images and layout preserved.<br>'
+    resultBox.innerHTML='<strong>&#10003; Conversion successful!</strong><br>Hyperlinks, images and layout preserved.<br>'
       +'<a class="btn-download" href="'+url+'" download="'+base+'.pdf">'
       +'&#8659;&nbsp;&nbsp;Download PDF</a>';
   }catch(err){
@@ -771,7 +873,7 @@ def convert():
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({'error': f'Conversion error: {str(e)}'}), 500
-    safe = re.sub(r'[^\w\s-]', '', title or 'output').strip().replace(' ','_')[:60] or 'output'
+    safe = re.sub(r'[^\w\s-]', '', title or 'output').strip().replace(' ', '_')[:60] or 'output'
     return send_file(io.BytesIO(pdf_bytes), mimetype='application/pdf',
                      as_attachment=True, download_name=f'{safe}.pdf')
 
