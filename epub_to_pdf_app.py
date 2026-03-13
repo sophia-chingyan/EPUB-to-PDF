@@ -74,6 +74,10 @@ def resolve_path(base_dir, href):
 def is_external_url(href):
     return href.startswith(('http://', 'https://', 'mailto:', 'ftp://'))
 
+def is_ignored_url(href):
+    """URLs that should not be rendered as links at all."""
+    return href.startswith(('javascript:', 'data:'))
+
 def xml_escape(text):
     """Escape text for use inside ReportLab XML paragraph markup."""
     return (text
@@ -92,6 +96,8 @@ def get_rich_text(node, base_font_name='Times-Roman'):
       - Bold / strong        → <b>text</b>
       - Italic / em          → <i>text</i>
       - Underline            → <u>text</u>
+      - Superscript          → <super>text</super>   (ReportLab tag)
+      - Subscript            → <sub>text</sub>
     Plain text is XML-escaped; markup tags are emitted as literals.
     """
     parts = []
@@ -112,7 +118,10 @@ def get_rich_text(node, base_font_name='Times-Roman'):
             inner = get_rich_text(child, base_font_name)
             if not inner.strip():
                 continue
-            if href and is_external_url(href):
+            # FIX: skip javascript: and data: URLs entirely
+            if href and is_ignored_url(href):
+                parts.append(inner)
+            elif href and is_external_url(href):
                 # Clickable PDF hyperlink
                 safe_href = xml_escape(href)
                 parts.append(
@@ -143,11 +152,22 @@ def get_rich_text(node, base_font_name='Times-Roman'):
             if inner.strip():
                 parts.append(f'<u>{inner}</u>')
 
+        # FIX: handle <sup> → ReportLab <super>, and <sub> → <sub>
+        elif tag == 'sup':
+            inner = get_rich_text(child, base_font_name)
+            if inner.strip():
+                parts.append(f'<super>{inner}</super>')
+
+        elif tag == 'sub':
+            inner = get_rich_text(child, base_font_name)
+            if inner.strip():
+                parts.append(f'<sub>{inner}</sub>')
+
         elif tag in ('span', 'small', 'big', 'font', 'abbr', 'cite',
-                     'code', 'kbd', 'samp', 'var', 'mark', 'sub', 'sup',
+                     'code', 'kbd', 'samp', 'var', 'mark',
                      'bdi', 'bdo', 'q', 'ruby', 'rt', 'rp', 'time',
                      'data', 'dfn'):
-            # Inline containers — recurse
+            # Inline containers — recurse (sub/sup removed from this list)
             inner = get_rich_text(child, base_font_name)
             if inner.strip():
                 parts.append(inner)
@@ -390,7 +410,7 @@ def parse_html_chapter(html_content, chapter_base, image_map):
 
         if tag in ('ul', 'ol'):
             for i, li in enumerate(node.find_all('li', recursive=False)):
-                bullet = f'{i+1}.' if tag == 'ol' else '•'
+                bullet = f'{i+1}.' if tag == 'ol' else '\u2022'
                 rt = get_rich_text(li)
                 if rt.strip():
                     elements.append({'type': 'li', 'text': f'{bullet} {rt}',
@@ -400,7 +420,7 @@ def parse_html_chapter(html_content, chapter_base, image_map):
         if tag == 'li':
             rt = get_rich_text(node)
             if rt.strip():
-                elements.append({'type': 'li', 'text': f'• {rt}',
+                elements.append({'type': 'li', 'text': f'\u2022 {rt}',
                                   'rich': True, 'depth': list_depth})
             return
 
